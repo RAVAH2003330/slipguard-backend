@@ -49,7 +49,7 @@ def inspect_slip_with_gemini(image_input, expected_amount: float = 0.0, *args, *
         }
 
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-3.5-flash-lite",
             generation_config=generation_config
         )
 
