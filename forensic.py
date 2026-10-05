@@ -8,24 +8,24 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3.5-flash")
 
-SYSTEM_PROMPT = """
-You are an expert Sri Lankan Banking Forensic Document Examiner.
-Analyze this bank transfer receipt/slip image. Look closely for:
-1. Font mismatches, digital text insertions, altered amounts or reference numbers.
-2. Irregular artifact edges, box misalignments, blurred backgrounds behind text.
-3. Extract: bank_name, detected_amount, reference_number.
+# forensic.py හි prompt එක පහත පරිදි සකසන්න:
 
-Return strictly raw JSON format without markdown code blocks:
+prompt = """
+You are a Sri Lankan bank slip verification specialist. Analyze the uploaded receipt image.
+
+Important Instructions on Image Artifacts:
+- Note: Standard mobile screenshots, WhatsApp compression artifacts, lighting shadows, camera blur, or slight angle tilts are NORMAL and NOT tampering.
+- Only flag high risk (risk_score > 40) if there are clear visual signs of digital editing: mismatched font styles, different text baseline, whiteout/cut-paste boxes over digits, or painted pixels over the original amount.
+- If it looks like an authentic bank receipt with typical mobile/WhatsApp JPEG compression, keep risk_score below 20.
+
+Extract the following in valid JSON:
 {
-  "bank_name": "Commercial Bank / BOC / Sampath / People's / HNB / etc",
-  "amount": 3500.00,
-  "reference_number": "12345678",
-  "is_tampered": false,
-  "risk_score_percentage": 5,
-  "anomaly_reasons": [],
-  "verdict": "CLEAN / LOW RISK"
+  "bank_name": "Name of the Bank",
+  "detected_amount": float,
+  "reference_number": "Reference or Transaction ID",
+  "risk_score": integer (0 to 100),
+  "verdict": "CLEAN / LOW RISK" or "SUSPICIOUS"
 }
-If tampered or altered, set "is_tampered": true, "verdict": "TAMPERED", and risk_score_percentage above 75.
 """
 
 def inspect_slip_with_gemini(image: Image.Image) -> dict:
