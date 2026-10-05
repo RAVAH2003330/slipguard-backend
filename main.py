@@ -30,6 +30,30 @@ def get_db():
 # 2. App & Middleware
 app = FastAPI(title="SlipGuard AI Central SaaS Engine", version="1.0.0")
 
+from datetime import datetime, timedelta
+from models import SessionLocal, Merchant, init_db
+
+# Database tables සාදා ගැනීම
+init_db()
+
+# Test Merchant කෙනෙකු නොමැති නම් ස්වයංක්‍රීයව සාදා ගැනීම
+db = SessionLocal()
+test_merchant = db.query(Merchant).filter(Merchant.api_key == "sg_live_test_12345678").first()
+if not test_merchant:
+    demo_merchant = Merchant(
+        merchant_name="Demo Store",
+        email="admin@demo.com",
+        api_key="sg_live_test_12345678",
+        subscription_plan="STARTER",
+        slips_limit_monthly=1000,
+        slips_used_this_month=0,
+        subscription_expires_at=datetime.utcnow() + timedelta(days=365),
+        is_active=True
+    )
+    db.add(demo_merchant)
+    db.commit()
+db.close()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
