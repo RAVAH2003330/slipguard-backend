@@ -1,9 +1,10 @@
 # forensic.py
 import json
+import os
 import google.generativeai as genai
 from PIL import Image
 
-GEMINI_API_KEY = "AQ.Ab8RN6I0kxBFLWP54vWGJrsR_lbx1gBb4m5vq_CUp52-Zpt5-g"  # ඔබේ Gemini API Key එක මෙතැනට දමන්න
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3.5-flash")
 
