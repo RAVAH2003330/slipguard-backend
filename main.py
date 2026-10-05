@@ -14,7 +14,7 @@ from PIL import Image
 from models import Base, MerchantAccount, TransactionSlip
 from forensic import inspect_slip_with_gemini
 
-# 1. Database Initialization (SQLite for local testing / PostgreSQL for production)
+# 1. Database Initialization
 DATABASE_URL = "sqlite:///./slipguard.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -30,30 +30,6 @@ def get_db():
 # 2. App & Middleware
 app = FastAPI(title="SlipGuard AI Central SaaS Engine", version="1.0.0")
 
-from datetime import datetime, timedelta
-from models import SessionLocal, Merchant, init_db
-
-# Database tables සාදා ගැනීම
-init_db()
-
-# Test Merchant කෙනෙකු නොමැති නම් ස්වයංක්‍රීයව සාදා ගැනීම
-db = SessionLocal()
-test_merchant = db.query(Merchant).filter(Merchant.api_key == "sg_live_test_12345678").first()
-if not test_merchant:
-    demo_merchant = Merchant(
-        merchant_name="Demo Store",
-        email="admin@demo.com",
-        api_key="sg_live_test_12345678",
-        subscription_plan="STARTER",
-        slips_limit_monthly=1000,
-        slips_used_this_month=0,
-        subscription_expires_at=datetime.utcnow() + timedelta(days=365),
-        is_active=True
-    )
-    db.add(demo_merchant)
-    db.commit()
-db.close()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -62,13 +38,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PAYHERE_SECRET = "YOUR_PAYHERE_MERCHANT_SECRET"
+PAYHERE_SECRET = os.getenv("PAYHERE_SECRET", "YOUR_PAYHERE_MERCHANT_SECRET")
+
+# 3. Test Merchant කෙනෙකු ස්වයංක්‍රීයව සාදා ගැනීම (Startup)
+@app.on_event("startup")
+def setup_test_merchant():
+    db = SessionLocal()
+    try:
+        test_merchant = db.query(MerchantAccount).filter(MerchantAccount.api_key == "sg_live_test_12345678").first()
+        if not test_merchant:
+            demo = MerchantAccount(
+                business_name="Demo Store",
+                email="admin@demo.com",
+                api_key="sg_live_test_12345678",
+                subscription_plan="STARTER",
+                subscription_status="ACTIVE",
+                monthly_limit=1000,
+                used_credits_this_month=0,
+                subscription_expires_at=datetime.utcnow() + timedelta(days=365)
+            )
+            db.add(demo)
+            db.commit()
+    except Exception as e:
+        print(f"Merchant setup notice: {e}")
+    finally:
+        db.close()
 
 # =====================================================================
 # Endpoints
 # =====================================================================
 
-# 1. Verification Endpoint (WooCommerce Checkout එකෙන් Call වන Endpoint එක)
+# 1. Verification Endpoint
 @app.post("/api/v1/verify-slip")
 async def verify_slip_endpoint(
     order_id: str = Form(...),
@@ -166,7 +166,7 @@ async def verify_slip_endpoint(
     }
 
 
-# 2. Merchant Status Endpoint (Plugin Settings Page එකේ Live Status පෙන්වීමට)
+# 2. Merchant Status Endpoint (Plugin Settings එකට තත්ත්වය පෙන්වීම)
 @app.get("/api/v1/merchant-status")
 async def get_merchant_status(x_api_key: str = Header(...), db: Session = Depends(get_db)):
     merchant = db.query(MerchantAccount).filter(MerchantAccount.api_key == x_api_key).first()
@@ -188,7 +188,7 @@ async def get_merchant_status(x_api_key: str = Header(...), db: Session = Depend
     }
 
 
-# 3. PayHere Subscription Webhook (Auto-Renewal)
+# 3. PayHere Subscription Webhook
 @app.post("/webhook/payhere-subscription")
 async def payhere_ipn(
     merchant_id: str = Form(...),
@@ -197,10 +197,9 @@ async def payhere_ipn(
     payhere_currency: str = Form(...),
     status_code: str = Form(...),
     md5sig: str = Form(...),
-    custom_1: str = Form(...),  # Merchant ID pass කරනු ලැබේ
+    custom_1: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    # Verify MD5 Signature
     secret_hash = hashlib.md5(PAYHERE_SECRET.encode('utf-8')).hexdigest().upper()
     check_str = f"{merchant_id}{order_id}{payhere_amount}{payhere_currency}{status_code}{secret_hash}"
     calculated_md5 = hashlib.md5(check_str.encode('utf-8')).hexdigest().upper()
@@ -208,7 +207,7 @@ async def payhere_ipn(
     if calculated_md5 != md5sig:
         raise HTTPException(status_code=400, detail="Invalid PayHere MD5 Signature")
 
-    if status_code == "2":  # Success
+    if status_code == "2":
         merchant = db.query(MerchantAccount).filter(MerchantAccount.id == int(custom_1)).first()
         if merchant:
             now = datetime.utcnow()
