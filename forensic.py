@@ -1,23 +1,32 @@
 import os
 import json
 import re
+import io
 from PIL import Image
 import google.generativeai as genai
 
-# Gemini API Key එක පරිසර විචල්‍යයන්ගෙන් (Environment Variables) ලබා ගැනීම
+# Gemini API Key එක Environment Variables වලින් ලබා ගැනීම
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 
-def analyze_bank_slip(image_file, expected_amount: float = 0.0) -> dict:
+def inspect_slip_with_gemini(image_input, expected_amount: float = 0.0, *args, **kwargs) -> dict:
     """
-    ශ්‍රී ලංකාවේ බැංකු රිසිට්පත් විශ්ලේෂණය කර මුදල, බැංකුව, 
+    ශ්‍රී ලාංකික බැංකු රිසිට්පත් විශ්ලේෂණය කර මුදල, බැංකුව, 
     ගනුදෙනු අංකය සහ ව්‍යාජ සංස්කරණ (Tampering) හඳුනාගැනීම.
     """
     try:
-        # රූප ගොනුව විවෘත කිරීම
-        image = Image.open(image_file)
+        # Input එක bytes, file-like object, හෝ path එකක් වුවද Image එක නිවැරදිව open කිරීම
+        if isinstance(image_input, bytes):
+            image = Image.open(io.BytesIO(image_input))
+        elif hasattr(image_input, "read"):
+            image_bytes = image_input.read()
+            if hasattr(image_input, "seek"):
+                image_input.seek(0)
+            image = Image.open(io.BytesIO(image_bytes))
+        else:
+            image = Image.open(image_input)
 
         # Gemini 1.5 Flash ආකෘතිය භාවිතය
         model = genai.GenerativeModel("gemini-3.5-flash")
@@ -55,18 +64,17 @@ def analyze_bank_slip(image_file, expected_amount: float = 0.0) -> dict:
         }}
         """
 
-        # Gemini වෙත Request එක යැවීම
         response = model.generate_content([prompt, image])
         text_resp = response.text.strip()
 
-        # Markdown code fences (```json ... ```) ඇත්නම් ඉවත් කිරීම
+        # Markdown code blocks (```json ... ```) ඇත්නම් ඉවත් කිරීම
         if text_resp.startswith("```"):
             text_resp = re.sub(r"^```[a-zA-Z]*\n?", "", text_resp)
             text_resp = re.sub(r"```$", "", text_resp).strip()
 
         data = json.loads(text_resp)
 
-        # Amount එක නිවැරදි float අගයක් බවට පත් කිරීම
+        # Amount එක float එකක් බව තහවුරු කරගැනීම
         raw_amt = data.get("detected_amount", 0.0)
         if isinstance(raw_amt, str):
             clean_amt = re.sub(r"[^\d.]", "", raw_amt)
@@ -74,14 +82,13 @@ def analyze_bank_slip(image_file, expected_amount: float = 0.0) -> dict:
         else:
             data["detected_amount"] = float(raw_amt or 0.0)
 
-        # Risk score නිවැරදි integer එකක් බවට පත් කිරීම
+        # Risk score integer එකක් කිරීම
         data["risk_score"] = int(data.get("risk_score", 10))
 
         # Verdict එක තහවුරු කිරීම
         if "verdict" not in data or not data["verdict"]:
             data["verdict"] = "CLEAN / LOW RISK" if data["risk_score"] <= 40 else "SUSPICIOUS"
 
-        # අමතර හිස් අගයන් සඳහා defaults
         if not data.get("bank_name"):
             data["bank_name"] = "Bank Transfer"
         if not data.get("reference_number"):
@@ -99,3 +106,6 @@ def analyze_bank_slip(image_file, expected_amount: float = 0.0) -> dict:
             "verdict": "ERROR",
             "error": str(e)
         }
+
+# Alias එකක් ලෙස analyze_bank_slip ද තබා ගැනීම
+analyze_bank_slip = inspect_slip_with_gemini
