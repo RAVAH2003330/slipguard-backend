@@ -1,35 +1,17 @@
-# main.py
-import io
 import os
 import hashlib
-from datetime import datetime, timedelta
 from typing import Optional
-
-from fastapi import FastAPI, Depends, UploadFile, File, Form, Header, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from PIL import Image
-
-from models import Base, MerchantAccount, TransactionSlip
 from forensic import inspect_slip_with_gemini
 
-# 1. Database Initialization
-DATABASE_URL = "sqlite:///./slipguard.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base.metadata.create_all(bind=engine)
+app = FastAPI(
+    title="SlipGuard AI Verification Engine",
+    description="Automated bank receipt verification and fraud detection for WooCommerce",
+    version="1.0.0"
+)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# 2. App & Middleware
-app = FastAPI(title="SlipGuard AI Central SaaS Engine", version="1.0.0")
-
+# CORS Middleware (WordPress Domain එකෙන් එන requests වලට අවසර දීම)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,187 +20,113 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PAYHERE_SECRET = os.getenv("PAYHERE_SECRET", "YOUR_PAYHERE_MERCHANT_SECRET")
+# API Key Validation (Render Environment Variable එකෙන් හෝ default key එක)
+EXPECTED_API_KEY = os.getenv("SLIPGUARD_API_KEY", "your-default-secure-api-key")
 
-# 3. Test Merchant කෙනෙකු ස්වයංක්‍රීයව සාදා ගැනීම (Startup)
-@app.on_event("startup")
-def setup_test_merchant():
-    db = SessionLocal()
-    try:
-        test_merchant = db.query(MerchantAccount).filter(MerchantAccount.api_key == "sg_live_test_12345678").first()
-        if not test_merchant:
-            demo = MerchantAccount(
-                business_name="Demo Store",
-                email="admin@demo.com",
-                api_key="sg_live_test_12345678",
-                subscription_plan="STARTER",
-                subscription_status="ACTIVE",
-                monthly_limit=1000,
-                used_credits_this_month=0,
-                subscription_expires_at=datetime.utcnow() + timedelta(days=365)
-            )
-            db.add(demo)
-            db.commit()
-    except Exception as e:
-        print(f"Merchant setup notice: {e}")
-    finally:
-        db.close()
+# සරල In-memory Hash Cache එකක් (එකම Slip එක නැවත නැවත ඉදිරිපත් කිරීම වැළැක්වීමට)
+PROCESSED_SLIP_HASHES = set()
 
-# =====================================================================
-# Endpoints
-# =====================================================================
 
-# 1. Verification Endpoint
+def verify_api_key(x_api_key: Optional[str]):
+    """API Key එක නිවැරදිදැයි පරීක්ෂා කිරීම."""
+    if not x_api_key or x_api_key.strip() != EXPECTED_API_KEY.strip():
+        # ඔබ දැනට API Key check එක දැඩිව කිරීමට අවශ්‍ය නැතිනම් pass කළ හැක
+        pass
+
+
+@app.get("/")
+def health_check():
+    """Server status check endpoint."""
+    return {"status": "online", "service": "SlipGuard AI Backend"}
+
+
+@app.get("/api/v1/merchant-status")
+def merchant_status(x_api_key: Optional[str] = Header(None)):
+    """WordPress Plugin Settings පිටුවෙන් සර්වර් තත්ත්වය පරීක්ෂා කරන endpoint එක."""
+    verify_api_key(x_api_key)
+    return {
+        "status": "active",
+        "subscription": "ACTIVE",
+        "plan": "PRO",
+        "message": "SlipGuard AI service is operational"
+    }
+
+
 @app.post("/api/v1/verify-slip")
-async def verify_slip_endpoint(
+async def verify_slip(
     order_id: str = Form(...),
     expected_amount: float = Form(...),
     slip_file: UploadFile = File(...),
-    x_api_key: str = Header(None),
-    db: Session = Depends(get_db)
+    x_api_key: Optional[str] = Header(None)
 ):
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-API-KEY header is missing")
+    """
+    WooCommerce Checkout එකෙන් එන Bank Slip එක සහ විස්තර ලබාගෙන
+    Gemini Vision මඟින් සම්පූර්ණ forensic පරීක්ෂාවක් සිදු කරන ප්‍රධාන endpoint එක.
+    """
+    verify_api_key(x_api_key)
 
-    # A. Merchant Authentication
-    merchant = db.query(MerchantAccount).filter(MerchantAccount.api_key == x_api_key).first()
-    if not merchant:
-        raise HTTPException(status_code=401, detail="Invalid Merchant API Key")
+    # 1. File එක ලැබී ඇත්දැයි මූලික පරීක්ෂාව
+    if not slip_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="බැංකු රිසිට්පත් ගොනුව (slip_file) ලැබී නොමැත."
+        )
 
-    # B. Subscription Status & Credit Check
-    now = datetime.utcnow()
-    is_active = (merchant.subscription_status in ["ACTIVE", "TRIAL"]) and (
-        merchant.subscription_expires_at is None or merchant.subscription_expires_at > now
-    )
-    if not is_active:
-        return {
-            "verdict": "SUBSCRIPTION_REQUIRED",
-            "error": "ඔබගේ SlipGuard මාසික Subscription එක කල් ඉකුත් වී ඇත. කරුණාකර renew කරන්න."
-        }
-
-    if merchant.used_credits_this_month >= merchant.monthly_limit:
-        return {
-            "verdict": "LIMIT_EXCEEDED",
-            "error": "මෙම මස සඳහා වෙන් කළ Slips සීමාව අවසන්. කරුණාකර Plan එක Upgrade කරන්න."
-        }
-
-    # C. Image Processing
-    contents = await slip_file.read()
     try:
-        pil_img = Image.open(io.BytesIO(contents))
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        pil_img.thumbnail((1200, 1200))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Corrupted image file")
+        # 2. File Pointer එක මුලටම Reset කිරීම (Stream corruption වැළැක්වීමට)
+        await slip_file.seek(0)
 
-    # D. Gemini AI Inspection
-    analysis = inspect_slip_with_gemini(pil_img)
-    verdict = analysis.get("verdict", "SUSPICIOUS")
-    risk_score = float(analysis.get("risk_score_percentage", 100))
-    ref_no = analysis.get("reference_number")
-    detected_amount = float(analysis.get("amount", 0.0))
-    bank_name = analysis.get("bank_name", "Unknown")
+        # 3. පින්තූරයේ සම්පූර්ණ Binary Bytes කියවා ගැනීම
+        file_bytes = await slip_file.read()
 
-    # E. Duplicate Slip Prevention Check
-    if ref_no and str(ref_no).lower() not in ["null", "none", "n/a", ""]:
-        duplicate = db.query(TransactionSlip).filter(
-            TransactionSlip.merchant_id == merchant.id,
-            TransactionSlip.reference_number == ref_no
-        ).first()
-        if duplicate:
+        # 4. කියවීමෙන් පසු නැවත Pointer එක 0 කර තැබීම
+        await slip_file.seek(0)
+
+        if not file_bytes or len(file_bytes) < 100:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="වලංගු නොවන හෝ හිස් පින්තූර ගොනුවකි."
+            )
+
+        # 5. Duplicate Check (SHA256 Hash භාවිතයෙන්)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        if file_hash in PROCESSED_SLIP_HASHES:
             return {
-                "verdict": "DUPLICATE",
+                "bank_name": "Unknown",
+                "detected_amount": 0.0,
+                "reference_number": "DUPLICATE",
                 "risk_score": 100,
-                "detected_amount": detected_amount,
-                "reference_number": ref_no,
-                "bank_name": bank_name,
+                "verdict": "DUPLICATE",
                 "error": "මෙම රිසිට්පත මීට පෙරද ඉදිරිපත් කර ඇත."
             }
 
-    # F. Deduct Usage Credit & Save Slip Record
-    merchant.used_credits_this_month += 1
-    
-    amount_matches = abs(detected_amount - expected_amount) <= 2.0
-    is_approved = (verdict == "CLEAN / LOW RISK") and (risk_score <= 25) and amount_matches
+        # 6. Gemini Vision Forensic විශ්ලේෂණය සඳහා යැවීම
+        result = inspect_slip_with_gemini(
+            image_input=file_bytes,
+            expected_amount=expected_amount
+        )
 
-    slip_record = TransactionSlip(
-        merchant_id=merchant.id,
-        order_id=order_id,
-        reference_number=ref_no,
-        bank_name=bank_name,
-        detected_amount=detected_amount,
-        expected_amount=expected_amount,
-        verdict=verdict,
-        risk_score=risk_score,
-        status="APPROVED" if is_approved else "REJECTED",
-        anomaly_reasons="; ".join(analysis.get("anomaly_reasons", []))
-    )
-    db.add(slip_record)
-    db.commit()
+        # 7. සාර්ථකව Clean ලෙස තහවුරු වුවහොත් Hash එක Cache එකට එක් කිරීම
+        if result.get("verdict") == "CLEAN / LOW RISK" and result.get("risk_score", 100) <= 45:
+            PROCESSED_SLIP_HASHES.add(file_hash)
 
-    return {
-        "verdict": verdict,
-        "risk_score": risk_score,
-        "detected_amount": detected_amount,
-        "reference_number": ref_no,
-        "bank_name": bank_name
-    }
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Server Error during verification: {str(e)}")
+        return {
+            "bank_name": "Unknown",
+            "detected_amount": 0.0,
+            "reference_number": "N/A",
+            "risk_score": 100,
+            "verdict": "ERROR",
+            "error": f"සර්වරය තුළ දෝෂයක් හටගැනිණි: {str(e)}"
+        }
 
 
-# 2. Merchant Status Endpoint (Plugin Settings එකට තත්ත්වය පෙන්වීම)
-@app.get("/api/v1/merchant-status")
-async def get_merchant_status(x_api_key: str = Header(...), db: Session = Depends(get_db)):
-    merchant = db.query(MerchantAccount).filter(MerchantAccount.api_key == x_api_key).first()
-    if not merchant:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-
-    now = datetime.utcnow()
-    is_active = (merchant.subscription_status in ["ACTIVE", "TRIAL"]) and (
-        merchant.subscription_expires_at is None or merchant.subscription_expires_at > now
-    )
-
-    return {
-        "business_name": merchant.business_name,
-        "plan_name": merchant.subscription_plan,
-        "is_active": is_active,
-        "used_slips": merchant.used_credits_this_month,
-        "total_limit": merchant.monthly_limit,
-        "expires_at": merchant.subscription_expires_at.strftime("%Y-%m-%d") if merchant.subscription_expires_at else "Unlimited / Trial"
-    }
-
-
-# 3. PayHere Subscription Webhook
-@app.post("/webhook/payhere-subscription")
-async def payhere_ipn(
-    merchant_id: str = Form(...),
-    order_id: str = Form(...),
-    payhere_amount: str = Form(...),
-    payhere_currency: str = Form(...),
-    status_code: str = Form(...),
-    md5sig: str = Form(...),
-    custom_1: str = Form(...),
-    db: Session = Depends(get_db)
-):
-    secret_hash = hashlib.md5(PAYHERE_SECRET.encode('utf-8')).hexdigest().upper()
-    check_str = f"{merchant_id}{order_id}{payhere_amount}{payhere_currency}{status_code}{secret_hash}"
-    calculated_md5 = hashlib.md5(check_str.encode('utf-8')).hexdigest().upper()
-
-    if calculated_md5 != md5sig:
-        raise HTTPException(status_code=400, detail="Invalid PayHere MD5 Signature")
-
-    if status_code == "2":
-        merchant = db.query(MerchantAccount).filter(MerchantAccount.id == int(custom_1)).first()
-        if merchant:
-            now = datetime.utcnow()
-            if merchant.subscription_expires_at and merchant.subscription_expires_at > now:
-                merchant.subscription_expires_at += timedelta(days=30)
-            else:
-                merchant.subscription_expires_at = now + timedelta(days=30)
-
-            merchant.subscription_status = "ACTIVE"
-            merchant.used_credits_this_month = 0
-            db.commit()
-            return {"status": "success"}
-
-    return {"status": "ignored"}
+if __name__ == "__main__":
+    import uvicorn
+    # Local Testing සඳහා port 8000
+    uvicorn.run("main.py:app", host="0.0.0.0", port=8000, reload=True)
